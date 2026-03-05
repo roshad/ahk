@@ -1,0 +1,1 @@
+^F12::  Winset, Alwaysontop, , A
