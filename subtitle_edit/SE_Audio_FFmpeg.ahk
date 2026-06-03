@@ -1,114 +1,73 @@
-#Requires AutoHotkey v2.0
-#SingleInstance Force
-
-; 全局设置：按 Alt+Q 打开面板，鼠标侧键触发切音频
-!q::ShowMyPanel()
-XButton1::CutAudio()
-global g_panelGui := ""
-global g_mediaPathCache := ""
-global g_cmdShellSwitch := ""
-global g_progressGui := ""
-global g_progressList := ""
-global g_convertQueue := []
-global g_runningJobs := Map()
-global g_doneJobs := []
-global g_queueTimerStarted := false
-global g_jobSeq := 0
-global g_maxConcurrentJobs := 3
-; "/c" (close) or "/k" (keep) GetComSpecSwitchFromArgs()
-Persistent()
-InitAudioQueue()
-
-
-ShowMyPanel() {
-    global g_panelGui
-    if g_panelGui {
-        g_panelGui.Show()
-        return
-    }
-
-    g_panelGui := Gui("+AlwaysOnTop", "我的工具箱")
-    g_panelGui.SetFont("s12", "Microsoft YaHei")
-
-    g_panelGui.Add("Button", "w220 h40", "SE 精听切片").OnEvent("Click", (*) => SetTimer(() => CutAudio(), -100))
-    g_panelGui.Add("Button", "w220 h40", "转换进度").OnEvent("Click", (*) => SetTimer(() => ShowProgressWindow(), -100))
-    g_panelGui.Add("Button", "w220 h40", "示例功能").OnEvent("Click", (*) => SetTimer(() => MsgBox("你点了示例按钮"), -100))
-    g_panelGui.Add("Button", "w220 h40", "重载脚本").OnEvent("Click", (*) => SetTimer(() => Reload(), -100))
-
-    g_panelGui.Show()
-}
-
-CutAudio(*) {
-    global g_cmdShellSwitch
-    video_path := ResolveMediaPath()
-    if (video_path = "") {
-        MsgBox "未能自动获取媒体路径。请先在 Subtitle Edit 打开字幕，或手动选择音频/视频文件。"
-        return
-    }
-
-    output_dir := A_Desktop
-
-    A_Clipboard := ""
-    Send "^c"
-    if !ClipWait(2) {
-        MsgBox "复制失败，请重试"
-        return
-    }
-
-    try {
-        raw_text := GetClipboardText()
-    } catch {
-        MsgBox "剪贴板正在被其他程序占用，请重试"
-        return
-    }
-
-    if RegExMatch(raw_text, "s)(\d{2}:\d{2}:\d{2},\d{3})\s+-->\s+(\d{2}:\d{2}:\d{2},\d{3})\R(.*)", &m) {
-        start_time := StrReplace(m[1], ",", ".")
-        end_time := StrReplace(m[2], ",", ".")
-        subtitle := m[3]
-
-        subtitle := RegExReplace(subtitle, "<[^>]+>", "")
-        subtitle := RegExReplace(subtitle, "\s+", "")      ; Remove all whitespaces, newlines, tabs entirely
-        safe_name := Trim(RegExReplace(subtitle, "[\\/:*?<>|]", "_"))
-        safe_name := StrReplace(safe_name, '"', "_")
-
-        output_file := BuildUniqueOutputPath(output_dir, safe_name, "ogg")
-        EnqueueAudioJob(video_path, start_time, end_time, output_file, safe_name)
-        ToolTip "已加入转换队列: " safe_name
-        SetTimer () => ToolTip(), -2000
-    } else {
-        MsgBox "未能识别字幕格式，请确认选中了包含时间码的文本。"
-    }
-}
-
-GetClipboardText(timeoutMs := 1500) {
-    endTick := A_TickCount + timeoutMs
-    while (A_TickCount < endTick) {
-        try return A_Clipboard
-        catch
-            Sleep 30
-    }
-    throw Error("Clipboard busy")
-}
+; SE_Audio_FFmpeg.ahk
+; 处理音频媒体文件查找、提取和 FFmpeg 队列转换逻辑
 
 ResolveMediaPath() {
     global g_mediaPathCache
 
-    if (g_mediaPathCache != "" && FileExist(g_mediaPathCache))
+    if (g_mediaPathCache != "" && FileExist(g_mediaPathCache)) {
+        SaveLastMediaPath(g_mediaPathCache)
         return g_mediaPathCache
+    }
+
+    lastMediaPath := LoadLastMediaPath()
+    if (lastMediaPath != "" && FileExist(lastMediaPath)) {
+        g_mediaPathCache := lastMediaPath
+        return lastMediaPath
+    }
 
     if mediaPath := GetMediaPathFromSubtitleEdit() {
         g_mediaPathCache := mediaPath
+        SaveLastMediaPath(mediaPath)
         return mediaPath
     }
 
     selected := FileSelect(1, , "选择音频/视频文件", "Media Files (*.opus; *.mp3; *.wav; *.m4a; *.flac; *.ogg; *.aac; *.mp4; *.mkv; *.webm)")
     if (selected != "") {
         g_mediaPathCache := selected
+        SaveLastMediaPath(selected)
         return selected
     }
 
     return ""
+}
+
+LoadLastMediaPath() {
+    try {
+        path := IniRead(GetSeAudioSettingsPath(), "Media", "LastPath", "")
+        if (path != "" && FileExist(path))
+            return path
+    }
+    return ""
+}
+
+SaveLastMediaPath(path) {
+    if (path = "")
+        return
+
+    try {
+        settingsPath := GetSeAudioSettingsPath()
+        SplitPath settingsPath, , &settingsDir
+        if (settingsDir != "")
+            DirCreate(settingsDir)
+        IniWrite(path, settingsPath, "Media", "LastPath")
+    }
+}
+
+GetDefaultMediaSelectPath() {
+    global g_mediaPathCache
+
+    if (g_mediaPathCache != "" && FileExist(g_mediaPathCache))
+        return g_mediaPathCache
+
+    lastMediaPath := LoadLastMediaPath()
+    if (lastMediaPath != "")
+        return lastMediaPath
+
+    return ""
+}
+
+GetSeAudioSettingsPath() {
+    return A_AppData "\SE_Audio_FFmpeg\settings.ini"
 }
 
 GetMediaPathFromSubtitleEdit() {
@@ -278,34 +237,6 @@ FindSiblingMediaByBase(dir, baseName) {
     return ""
 }
 
-GetComSpecSwitchFromArgs() {
-    mode := "/k" ; default: keep command window open
-
-    for i, arg in A_Args {
-        a := StrLower(Trim(arg))
-
-        if (a = "--cmd=close" || a = "--close" || a = "/c" || a = "close") {
-            mode := "/c"
-            continue
-        }
-
-        if (a = "--cmd=keep" || a = "--keep" || a = "/k" || a = "keep") {
-            mode := "/k"
-            continue
-        }
-
-        if (a = "--cmd" && i < A_Args.Length) {
-            v := StrLower(Trim(A_Args[i + 1]))
-            if (v = "close" || v = "/c")
-                mode := "/c"
-            else if (v = "keep" || v = "/k")
-                mode := "/k"
-        }
-    }
-
-    return mode
-}
-
 InitAudioQueue() {
     global g_queueTimerStarted
 
@@ -313,13 +244,23 @@ InitAudioQueue() {
         return
 
     A_TrayMenu.Add()
+    A_TrayMenu.Add("手动指定音视频", ManualSelectMedia)
     A_TrayMenu.Add("转换进度", ShowProgressWindow)
     A_TrayMenu.Add("清空已完成记录", ClearFinishedJobs)
     SetTimer(ProcessAudioQueue, 500)
     g_queueTimerStarted := true
 }
 
-EnqueueAudioJob(videoPath, startTime, endTime, outputFile, displayName) {
+ManualSelectMedia(*) {
+    global g_mediaPathCache
+    selected := FileSelect(1, , "手动指定后续处理的音频/视频文件", "Media Files (*.opus; *.mp3; *.wav; *.m4a; *.flac; *.ogg; *.aac; *.mp4; *.mkv; *.webm)")
+    if (selected != "") {
+        g_mediaPathCache := selected
+        MsgBox("已强制指定，接下来的切片将使用此文件：`n" selected, "指定成功", "T3")
+    }
+}
+
+EnqueueAudioJob(videoPath, startTime, endTime, outputFile, displayName, originalText := "", translationText := "") {
     global g_convertQueue, g_jobSeq
 
     g_jobSeq += 1
@@ -344,7 +285,11 @@ EnqueueAudioJob(videoPath, startTime, endTime, outputFile, displayName) {
         startedAt: "",
         finishedAt: "",
         durationMs: TimeToMs(endTime) - TimeToMs(startTime),
-        detail: ""
+        detail: "",
+        originalText: originalText,
+        translationText: translationText,
+        ankiAdded: false,
+        ankiAttempted: false
     })
 
     RefreshProgressView()
@@ -355,6 +300,8 @@ ProcessAudioQueue(*) {
 
     for jobId, job in g_runningJobs.Clone() {
         UpdateRunningJob(job)
+        if (!ProcessExist(job.pid) && !job.ankiAttempted && FileExist(job.output))
+            AddAudioCardToAnki(job)
         if (job.state = "已完成" || job.state = "失败") {
             g_runningJobs.Delete(jobId)
             g_doneJobs.Push(job)
@@ -381,7 +328,9 @@ StartAudioJob(job) {
         job.logFile
     )
     cmdPayload := StrReplace(ffmpegArgs, '"', '""')
-    Run Format('{1} /d /q /c "{2}"', A_ComSpec, cmdPayload), , "Hide", &pid
+    
+    ; 强制 cmd.exe 使用 UTF-8 (65001) 来解析和运行命令行，防止带有日文的视频路径变成问号，导致找不到输入文件。
+    Run Format('{1} /d /q /c "chcp 65001 >nul & {2}"', A_ComSpec, cmdPayload), , "Hide", &pid
 
     job.pid := pid
     job.state := "转换中"
@@ -411,7 +360,9 @@ UpdateRunningJob(job) {
         job.state := "失败"
         job.detail := ReadTail(job.logFile, 1)
         if (job.detail = "")
-            job.detail := "ffmpeg 未生成输出文件"
+            job.detail := "ffmpeg 未生成输出"
+        ; 将输入文件包含在详情中，以便排查是不是路径本身找错了
+        job.detail := "输入文件: " GetFileName(job.input) " | " job.detail
     }
 }
 
@@ -425,7 +376,7 @@ ReadProgressFile(progressFile) {
         return result
 
     lastOutTimeMs := ""
-    for _, line in StrSplit(text, ["`r`n", "`n", "`r"]) {
+    for _, line in StrSplit(text, ["``r``n", "``n", "``r"]) {
         if (line = "")
             continue
         if RegExMatch(line, "i)^out_time_ms=(\d+)$", &m)
@@ -485,66 +436,6 @@ BuildUniqueOutputPath(outputDir, baseName, ext) {
     return candidate
 }
 
-ShowProgressWindow(*) {
-    global g_progressGui, g_progressList
-
-    if !g_progressGui {
-        g_progressGui := Gui("+AlwaysOnTop +Resize", "音频转换队列")
-        g_progressGui.SetFont("s10", "Microsoft YaHei")
-        g_progressList := g_progressGui.Add("ListView", "w860 r18 Grid", ["ID", "状态", "进度", "片段名", "开始", "结束", "输出文件", "详情"])
-        g_progressGui.Add("Button", "xm w120 h32", "刷新").OnEvent("Click", RefreshProgressView)
-        g_progressGui.Add("Button", "x+10 w120 h32", "清空已完成").OnEvent("Click", ClearFinishedJobs)
-        g_progressGui.OnEvent("Close", (*) => g_progressGui.Hide())
-    }
-
-    RefreshProgressView()
-    g_progressGui.Show()
-}
-
-RefreshProgressView(*) {
-    global g_progressGui, g_progressList, g_convertQueue, g_runningJobs, g_doneJobs
-
-    if !g_progressGui || !g_progressList
-        return
-
-    g_progressList.Opt("-Redraw")
-    g_progressList.Delete()
-
-    for _, job in g_runningJobs
-        AddJobRow(job)
-    for _, job in g_convertQueue
-        AddJobRow(job)
-    loopCount := g_doneJobs.Length
-    Loop loopCount {
-        job := g_doneJobs[loopCount - A_Index + 1]
-        AddJobRow(job)
-    }
-
-    try g_progressList.ModifyCol()
-    g_progressList.Opt("+Redraw")
-}
-
-AddJobRow(job) {
-    global g_progressList
-    g_progressList.Add(
-        ,
-        job.id,
-        job.state,
-        job.percent "%",
-        job.name,
-        job.startedAt != "" ? job.startedAt : job.createdAt,
-        job.finishedAt,
-        job.output,
-        job.detail
-    )
-}
-
-ClearFinishedJobs(*) {
-    global g_doneJobs
-    g_doneJobs := []
-    RefreshProgressView()
-}
-
 ReadTail(path, lineCount := 1) {
     if !FileExist(path)
         return ""
@@ -554,7 +445,7 @@ ReadTail(path, lineCount := 1) {
         return ""
 
     lines := []
-    for _, line in StrSplit(text, ["`r`n", "`n", "`r"]) {
+    for _, line in StrSplit(text, ["``r``n", "``n", "``r"]) {
         if (Trim(line) != "")
             lines.Push(line)
     }
