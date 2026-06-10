@@ -16,10 +16,11 @@ global g_doneJobs := []
 global g_queueTimerStarted := false
 global g_jobSeq := 0
 global g_maxConcurrentJobs := 3
-global g_ankiDeckName := "00active::0日文::考試::N1::2512"
+global g_ankiDeckName := "00active::0日文::0例句::听力"
 global g_ankiNoteType := "0常"
 global g_ankiFrontField := "Front"
 global g_ankiBackField := "Back"
+global g_ankiTags := ["日日语::jlpt::N1::2512"]  ; 可以是数组如 ["tag1", "tag2"]，或者空格分隔的字符串如 "tag1 tag2"，或者逗号分隔的字符串如 "tag1,tag2"
 ; "/c" (close) or "/k" (keep) GetComSpecSwitchFromArgs()
 Persistent()
 InitAudioQueue()
@@ -489,7 +490,7 @@ AddAudioCardToAnki(job) {
 }
 
 SendAnkiAddNoteRequest(audioPath, originalText, translationText) {
-    global g_ankiDeckName, g_ankiNoteType, g_ankiFrontField, g_ankiBackField
+    global g_ankiDeckName, g_ankiNoteType, g_ankiFrontField, g_ankiBackField, g_ankiTags
 
     backHtml := BuildAnkiBackHtml(originalText, translationText)
 
@@ -504,6 +505,7 @@ SendAnkiAddNoteRequest(audioPath, originalText, translationText) {
         . '"' JsonEscape(g_ankiFrontField) '":"",'
         . '"' JsonEscape(g_ankiBackField) '":"' JsonEscape(backHtml) '"'
         . '},'
+        . '"tags":' BuildAnkiTagsJson(g_ankiTags) ','
         . '"options":{"allowDuplicate":true},'
         . '"audio":[{'
         . '"path":"' JsonEscape(audioPath) '",'
@@ -536,6 +538,28 @@ BuildAnkiBackHtml(originalText, translationText) {
     if (translationText != "")
         backHtml .= "<br><br>" StrReplace(HtmlEscape(translationText), "`n", "<br>")
     return backHtml
+}
+
+BuildAnkiTagsJson(tags) {
+    if (IsObject(tags)) {
+        jsonTags := ""
+        for _, tag in tags {
+            jsonTags .= (jsonTags = "" ? "" : ",") '"' JsonEscape(tag) '"'
+        }
+        return "[" jsonTags "]"
+    } else {
+        strTags := String(tags)
+        if (Trim(strTags) = "")
+            return "[]"
+        delim := InStr(strTags, ",") ? "," : " "
+        jsonTags := ""
+        for _, tag in StrSplit(strTags, delim) {
+            t := Trim(tag)
+            if (t != "")
+                jsonTags .= (jsonTags = "" ? "" : ",") '"' JsonEscape(t) '"'
+        }
+        return "[" jsonTags "]"
+    }
 }
 
 JsonEscape(text) {
