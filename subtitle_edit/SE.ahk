@@ -529,8 +529,14 @@ SendAnkiAddNoteRequest(audioPath, originalText, translationText) {
 
     http := ComObject("WinHttp.WinHttpRequest.5.1")
     http.Open("POST", "http://127.0.0.1:8765", false)
-    http.SetRequestHeader("Content-Type", "application/json")
-    http.Send(payload)
+    http.SetRequestHeader("Content-Type", "application/json; charset=utf-8")
+    
+    ; Convert payload to UTF-8 buffer to prevent encoding corruption (mojibake)
+    utf8Len := StrPut(payload, "UTF-8") - 1
+    utf8Buf := Buffer(utf8Len)
+    StrPut(payload, utf8Buf, "UTF-8")
+    
+    http.Send(utf8Buf)
     return http.ResponseText
 }
 
