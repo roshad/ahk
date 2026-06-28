@@ -20,7 +20,7 @@ global g_ankiDeckName := "00active::0日文::0例句::听力"
 global g_ankiNoteType := "0常"
 global g_ankiFrontField := "Front"
 global g_ankiBackField := "Back"
-global g_ankiTags := ["日日语::jlpt::N1::2512"]  ; 可以是数组如 ["tag1", "tag2"]，或者空格分隔的字符串如 "tag1 tag2"，或者逗号分隔的字符串如 "tag1,tag2"
+global g_ankiTags := ["日语::jlpt::N1::2412"]  ; 可以是数组如 ["tag1", "tag2"]，或者空格分隔的字符串如 "tag1 tag2"，或者逗号分隔的字符串如 "tag1,tag2"
 ; "/c" (close) or "/k" (keep) GetComSpecSwitchFromArgs()
 Persistent()
 InitAudioQueue()
@@ -493,8 +493,21 @@ SendAnkiAddNoteRequest(audioPath, originalText, translationText) {
     global g_ankiDeckName, g_ankiNoteType, g_ankiFrontField, g_ankiBackField, g_ankiTags
 
     backHtml := BuildAnkiBackHtml(originalText, translationText)
-
     audioFileName := GetFileName(audioPath)
+
+    frontHtml := '<audio id="anki-audio" src="' audioFileName '" controls autoplay style="width: 100%; max-width: 480px; margin: 10px auto; display: block;"></audio>'
+        . '<script>'
+        . 'if (!window.ankiAudioListenerAdded) {'
+        . '    window.ankiAudioListenerAdded = true;'
+        . '    document.addEventListener("keydown", function(e) {'
+        . '        if (e.key === "r" || e.key === "R") {'
+        . '            var audio = document.getElementById("anki-audio");'
+        . '            if (audio) { audio.currentTime = 0; audio.play(); }'
+        . '        }'
+        . '    });'
+        . '}'
+        . '</script>'
+
     payload := '{'
         . '"action":"addNote",'
         . '"version":6,'
@@ -502,7 +515,7 @@ SendAnkiAddNoteRequest(audioPath, originalText, translationText) {
         . '"deckName":"' JsonEscape(g_ankiDeckName) '",'
         . '"modelName":"' JsonEscape(g_ankiNoteType) '",'
         . '"fields":{'
-        . '"' JsonEscape(g_ankiFrontField) '":"",'
+        . '"' JsonEscape(g_ankiFrontField) '":"' JsonEscape(frontHtml) '",'
         . '"' JsonEscape(g_ankiBackField) '":"' JsonEscape(backHtml) '"'
         . '},'
         . '"tags":' BuildAnkiTagsJson(g_ankiTags) ','
@@ -510,7 +523,7 @@ SendAnkiAddNoteRequest(audioPath, originalText, translationText) {
         . '"audio":[{'
         . '"path":"' JsonEscape(audioPath) '",'
         . '"filename":"' JsonEscape(audioFileName) '",'
-        . '"fields":["' JsonEscape(g_ankiFrontField) '"]'
+        . '"fields":[]'
         . '}]'
         . '}}}'
 
