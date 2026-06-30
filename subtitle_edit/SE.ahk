@@ -76,7 +76,10 @@ CutAudio(*) {
         safe_name := Trim(RegExReplace(subtitleInfo["filenameText"], "[\\/:*?<>|]", "_"))
         safe_name := StrReplace(safe_name, '"', "_")
 
-        output_file := BuildUniqueOutputPath(output_dir, safe_name, "ogg")
+        ; 使用纯数字与英文的组合作为物理文件名，彻底避免日文特殊符号导致的乱码及文件系统兼容问题
+        safe_filename := "audio_" FormatTime(, "yyyyMMdd_HHmmss") "_" Random(1000, 9999)
+        output_file := BuildUniqueOutputPath(output_dir, safe_filename, "ogg")
+        
         EnqueueAudioJob(video_path, start_time, end_time, output_file, safe_name, subtitleInfo["original"], subtitleInfo["translation"])
         ToolTip "已加入转换队列: " safe_name
         SetTimer () => ToolTip(), -2000
@@ -536,7 +539,13 @@ SendAnkiAddNoteRequest(audioPath, originalText, translationText) {
     utf8Buf := Buffer(utf8Len)
     StrPut(payload, utf8Buf, "UTF-8")
     
-    http.Send(utf8Buf)
+    ; Create COM SafeArray of bytes (VT_UI1 = 17) to ensure compatibility with WinHttpRequest
+    comArr := ComObjArray(17, utf8Len)
+    Loop utf8Len {
+        comArr[A_Index - 1] := NumGet(utf8Buf, A_Index - 1, "UChar")
+    }
+    
+    http.Send(comArr)
     return http.ResponseText
 }
 

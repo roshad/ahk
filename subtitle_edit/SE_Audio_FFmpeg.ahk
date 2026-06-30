@@ -319,12 +319,10 @@ ProcessAudioQueue(*) {
 
 StartAudioJob(job) {
     ffmpegArgs := Format(
-        'ffmpeg -hide_banner -nostats -ss {1} -to {2} -i "{3}" -vn -ac 1 -c:a libopus -b:a 32k -application voip -y -progress "{4}" "{5}" 1>"{6}" 2>&1',
+        'ffmpeg -hide_banner -ss {1} -to {2} -i "{3}" -vn -ac 1 -af "acompressor=threshold=-22dB:ratio=3:attack=5:release=80,alimiter=limit=0.95,loudnorm=I=-16:TP=-1.5:LRA=7:print_format=json" -f null - 2>"{4}"',
         job.start,
         job.end,
         job.input,
-        job.progressFile,
-        job.output,
         job.logFile
     )
     cmdPayload := StrReplace(ffmpegArgs, '"', '""')
@@ -333,36 +331,97 @@ StartAudioJob(job) {
     Run Format('{1} /d /q /c "chcp 65001 >nul & {2}"', A_ComSpec, cmdPayload), , "Hide", &pid
 
     job.pid := pid
-    job.state := "转换中"
+    job.state := "分析中"
     job.startedAt := FormatTime(, "HH:mm:ss")
-    job.detail := "PID " pid
+    job.detail := "分析中 (PID " pid ")"
 }
 
 UpdateRunningJob(job) {
-    progress := ReadProgressFile(job.progressFile)
-    if (progress.Has("percent"))
-        job.percent := progress["percent"]
+    if (job.state = "分析中") {
+        if ProcessExist(job.pid)
+            return
 
-    if (progress.Has("detail"))
-        job.detail := progress["detail"]
+        if !FileExist(job.logFile) {
+            job.state := "失败"
+            job.detail := "分析失败：日志文件不存在"
+            return
+        }
 
-    if ProcessExist(job.pid) {
-        job.state := "转换中"
+        try {
+            logText := FileRead(job.logFile, "UTF-8")
+        } catch {
+            try {
+                logText := FileRead(job.logFile)
+            } catch {
+                job.state := "失败"
+                job.detail := "分析失败：无法读取日志"
+                return
+            }
+        }
+
+        if (RegExMatch(logText, '"input_i"\s*:\s*"([^"]+)"', &matchI)
+            && RegExMatch(logText, '"input_tp"\s*:\s*"([^"]+)"', &matchTP)
+            && RegExMatch(logText, '"input_lra"\s*:\s*"([^"]+)"', &matchLRA)
+            && RegExMatch(logText, '"input_thresh"\s*:\s*"([^"]+)"', &matchThresh)
+            && RegExMatch(logText, '"target_offset"\s*:\s*"([^"]+)"', &matchOffset)) {
+            
+            measured_i := matchI[1]
+            measured_tp := matchTP[1]
+            measured_lra := matchLRA[1]
+            measured_thresh := matchThresh[1]
+            target_offset := matchOffset[1]
+            
+            ffmpegArgs := Format(
+                'ffmpeg -hide_banner -nostats -ss {1} -to {2} -i "{3}" -vn -ac 1 -af "acompressor=threshold=-22dB:ratio=3:attack=5:release=80,alimiter=limit=0.95,loudnorm=I=-16:TP=-1.5:LRA=7:measured_I={4}:measured_TP={5}:measured_LRA={6}:measured_thresh={7}:offset={8}:linear=true" -c:a libopus -b:a 32k -application voip -y -progress "{9}" "{10}" 1>"{11}" 2>&1',
+                job.start,
+                job.end,
+                job.input,
+                measured_i,
+                measured_tp,
+                measured_lra,
+                measured_thresh,
+                target_offset,
+                job.progressFile,
+                job.output,
+                job.logFile
+            )
+            
+            cmdPayload := StrReplace(ffmpegArgs, '"', '""')
+            Run Format('{1} /d /q /c "chcp 65001 >nul & {2}"', A_ComSpec, cmdPayload), , "Hide", &pid
+            
+            job.pid := pid
+            job.state := "转换中"
+            job.detail := "转换中 (PID " pid ")"
+        } else {
+            job.state := "失败"
+            job.detail := "分析失败：解析音量指标失败"
+        }
         return
     }
 
-    job.finishedAt := FormatTime(, "HH:mm:ss")
-    if FileExist(job.output) {
-        job.state := "已完成"
-        job.percent := 100
-        job.detail := "输出完成"
-    } else {
-        job.state := "失败"
-        job.detail := ReadTail(job.logFile, 1)
-        if (job.detail = "")
-            job.detail := "ffmpeg 未生成输出"
-        ; 将输入文件包含在详情中，以便排查是不是路径本身找错了
-        job.detail := "输入文件: " GetFileName(job.input) " | " job.detail
+    if (job.state = "转换中") {
+        progress := ReadProgressFile(job.progressFile)
+        if (progress.Has("percent"))
+            job.percent := progress["percent"]
+
+        if (progress.Has("detail"))
+            job.detail := progress["detail"]
+
+        if ProcessExist(job.pid)
+            return
+
+        job.finishedAt := FormatTime(, "HH:mm:ss")
+        if FileExist(job.output) {
+            job.state := "已完成"
+            job.percent := 100
+            job.detail := "输出完成"
+        } else {
+            job.state := "失败"
+            job.detail := ReadTail(job.logFile, 1)
+            if (job.detail = "")
+                job.detail := "ffmpeg 未生成输出"
+            job.detail := "输入文件: " GetFileName(job.input) " | " job.detail
+        }
     }
 }
 
@@ -376,7 +435,7 @@ ReadProgressFile(progressFile) {
         return result
 
     lastOutTimeMs := ""
-    for _, line in StrSplit(text, ["``r``n", "``n", "``r"]) {
+    for _, line in StrSplit(text, ["`r`n", "`n", "`r"]) {
         if (line = "")
             continue
         if RegExMatch(line, "i)^out_time_ms=(\d+)$", &m)
@@ -445,7 +504,7 @@ ReadTail(path, lineCount := 1) {
         return ""
 
     lines := []
-    for _, line in StrSplit(text, ["``r``n", "``n", "``r"]) {
+    for _, line in StrSplit(text, ["`r`n", "`n", "`r"]) {
         if (Trim(line) != "")
             lines.Push(line)
     }
