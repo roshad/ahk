@@ -24,11 +24,13 @@ global OrderPath := ""
 global TrashDir := ""
 global BackupDir := ""
 global SafetyBackupMade := false
-global SortGui := ""
-global SortList := ""
-global SortWorkingIds := []
+global SortModeActive := false
 global SortDragFrom := 0
 global SortDragTo := 0
+global SortDragMoved := false
+global SortOrderDirty := false
+global DarkEditHandles := Map()
+global DarkEditBrush := 0
 
 Initialize()
 
@@ -55,7 +57,7 @@ Initialize() {
     SettingsButton := MainGui.AddButton("x366 y22 w88 h34", "存储位置")
     AddButton.SetFont("s11 Bold", "Microsoft YaHei UI")
     AddButton.OnEvent("Click", OpenAddDialog)
-    SortButton.OnEvent("Click", OpenSortMode)
+    SortButton.OnEvent("Click", ToggleSortMode)
     TrashButton.OnEvent("Click", OpenTrashManager)
     SettingsButton.OnEvent("Click", ChooseStorageLocation)
 
@@ -84,6 +86,7 @@ Initialize() {
     OnMessage(0x0201, SortMouseDown)
     OnMessage(0x0200, SortMouseMove)
     OnMessage(0x0202, SortMouseUp)
+    OnMessage(0x0133, HandleEditControlColor)
 
     TrackActiveWindow()
     MainGui.Show("Maximize")
@@ -470,7 +473,9 @@ OpenSnippetDialog(snippet := 0) {
     dialog.OnEvent("Escape", CloseDialog.Bind(dialog))
 
     EnableDarkWindow(dialog)
-    for control in [titleEdit, contentEdit, saveButton, cancelButton]
+    for control in [titleEdit, contentEdit]
+        EnableDarkEdit(control)
+    for control in [saveButton, cancelButton]
         EnableDarkControl(control)
     dialog.Show("w620 h488")
     contentEdit.Focus()
@@ -777,161 +782,154 @@ EmptyTrash(list, *) {
     FillTrashList(list)
 }
 
-OpenSortMode(*) {
-    global MainGui, Snippets, SortGui, SortList, SortWorkingIds
+ToggleSortMode(*) {
+    global SortModeActive, SortButton, SortOrderDirty, Snippets
+
+    if SortModeActive {
+        if SortOrderDirty && !PersistSortOrder()
+            return
+
+        SortModeActive := false
+        SortButton.Text := "排序"
+        ShowTemporaryStatus("已退出排序模式")
+        return
+    }
 
     if (Snippets.Length < 2) {
         ShowTemporaryStatus("至少需要两个文本段才能排序")
         return
     }
 
-    SortWorkingIds := []
-    for snippet in Snippets
-        SortWorkingIds.Push(snippet.Id)
-
-    SortGui := Gui("+Owner" MainGui.Hwnd " +AlwaysOnTop", "拖动排序")
-    SortGui.BackColor := "202124"
-    SortGui.SetFont("s10 cE8EAED", "Microsoft YaHei UI")
-    SortGui.AddText("x20 y16 w700 h26", "按住条目并拖动到目标位置；保存后顺序立即生效。")
-    SortList := SortGui.AddListView("x20 y48 w700 h440 Grid -Multi", ["顺序", "标题", "正文预览", "ID"])
-    SortList.ModifyCol(1, 55)
-    SortList.ModifyCol(2, 220)
-    SortList.ModifyCol(3, 400)
-    SortList.ModifyCol(4, 0)
-    FillSortList()
-
-    saveButton := SortGui.AddButton("x518 y508 w98 h38 Default", "保存排序")
-    cancelButton := SortGui.AddButton("x626 y508 w94 h38", "取消")
-    saveButton.OnEvent("Click", SaveSortOrder)
-    cancelButton.OnEvent("Click", CloseSortMode)
-    SortGui.OnEvent("Close", CloseSortMode)
-    SortGui.OnEvent("Escape", CloseSortMode)
-
-    EnableDarkWindow(SortGui)
-    for control in [SortList, saveButton, cancelButton]
-        EnableDarkControl(control)
-    SortGui.Show("w740 h566")
-}
-
-FillSortList(selectRow := 0) {
-    global SortList, SortWorkingIds, Snippets
-
-    SortList.Delete()
-    byId := Map()
-    for snippet in Snippets
-        byId[snippet.Id] := snippet
-
-    for index, id in SortWorkingIds {
-        if !byId.Has(id)
-            continue
-        snippet := byId[id]
-        title := snippet.Title != "" ? snippet.Title : "（无标题）"
-        options := index = selectRow ? "Select Focus" : ""
-        SortList.Add(options, index, title, GetOneLinePreview(snippet.Content, 64), id)
-    }
+    SortModeActive := true
+    SortOrderDirty := false
+    SortButton.Text := "完成排序"
+    ShowTemporaryStatus("排序模式：直接拖动文本按钮调整顺序")
 }
 
 SortMouseDown(wParam, lParam, msg, hwnd) {
-    global SortList, SortDragFrom, SortDragTo
+    global SortModeActive, SortDragFrom, SortDragTo, SortDragMoved, ButtonToSnippet, MainGui
 
-    if !IsObject(SortList) || hwnd != SortList.Hwnd
+    if !SortModeActive || SortDragFrom || !ButtonToSnippet.Has(hwnd)
         return
 
-    row := ListViewHitTest(SortList.Hwnd, lParam)
-    if !row
+    snippet := ButtonToSnippet[hwnd]
+    index := FindSnippetIndex(snippet.Id)
+    if !index
         return
 
-    SortDragFrom := row
-    SortDragTo := row
-    DllCall("SetCapture", "Ptr", SortList.Hwnd)
+    SortDragFrom := index
+    SortDragTo := index
+    SortDragMoved := false
+    DllCall("SetCapture", "Ptr", MainGui.Hwnd)
+    return 0
 }
 
 SortMouseMove(wParam, lParam, msg, hwnd) {
-    global SortList, SortDragFrom, SortDragTo, SortWorkingIds
+    global SortModeActive, SortDragFrom, SortDragTo, SortDragMoved, SortOrderDirty
+    global Snippets, LastClientWidth, LastClientHeight
 
-    if !SortDragFrom || !IsObject(SortList)
+    if !SortModeActive || !SortDragFrom
         return
 
-    row := ListViewHitTest(SortList.Hwnd, lParam)
-    if !row {
-        y := SignedWord(lParam >> 16)
-        row := y < 0 ? 1 : SortWorkingIds.Length
-    }
-    row := Max(1, Min(row, SortWorkingIds.Length))
-    SortDragTo := row
-    SortList.Modify(row, "Select Focus Vis")
+    MouseGetPos(&screenX, &screenY)
+    target := GetSortTargetIndex(screenX, screenY)
+    if !target || target = SortDragTo
+        return 0
+
+    snippet := Snippets.RemoveAt(SortDragFrom)
+    Snippets.InsertAt(target, snippet)
+    SortDragFrom := target
+    SortDragTo := target
+    SortDragMoved := true
+    SortOrderDirty := true
+    LayoutCards(LastClientWidth, LastClientHeight)
+    return 0
 }
 
 SortMouseUp(wParam, lParam, msg, hwnd) {
-    global SortDragFrom, SortDragTo, SortWorkingIds
+    global SortDragFrom, SortDragTo, SortDragMoved
 
     if !SortDragFrom
         return
 
     DllCall("ReleaseCapture")
-    from := SortDragFrom
-    to := SortDragTo
+    moved := SortDragMoved
     SortDragFrom := 0
     SortDragTo := 0
+    SortDragMoved := false
 
-    if (from != to) {
-        id := SortWorkingIds.RemoveAt(from)
-        SortWorkingIds.InsertAt(to, id)
-        FillSortList(to)
+    if moved {
+        if PersistSortOrder()
+            ShowTemporaryStatus("文本顺序已保存")
+        else
+            ShowTemporaryStatus("顺序暂未保存，请重试")
     }
+    return 0
 }
 
-ListViewHitTest(hwnd, lParam) {
-    x := SignedWord(lParam & 0xFFFF)
-    y := SignedWord((lParam >> 16) & 0xFFFF)
-    info := Buffer(24, 0)
-    NumPut("Int", x, info, 0)
-    NumPut("Int", y, info, 4)
-    SendMessage(0x1012, 0, info.Ptr, , "ahk_id " hwnd)
-    item := NumGet(info, 12, "Int")
-    return item >= 0 ? item + 1 : 0
+GetSortTargetIndex(screenX, screenY) {
+    global Snippets
+
+    visible := []
+    for index, snippet in Snippets {
+        if !snippet.Button.Visible
+            continue
+
+        try WinGetPos(&x, &y, &width, &height, "ahk_id " snippet.Button.Hwnd)
+        catch
+            continue
+        if (width <= 0 || height <= 0)
+            continue
+
+        item := {
+            Index: index,
+            X: x,
+            Y: y,
+            Width: width,
+            Height: height,
+            CenterX: x + width / 2,
+            CenterY: y + height / 2
+        }
+        visible.Push(item)
+
+        if (screenX >= x && screenX < x + width && screenY >= y && screenY < y + height)
+            return index
+    }
+
+    if !visible.Length
+        return 0
+
+    nearest := visible[1]
+    nearestDistance := (screenX - nearest.CenterX) ** 2 + (screenY - nearest.CenterY) ** 2
+    for index, item in visible {
+        if (index = 1)
+            continue
+        distance := (screenX - item.CenterX) ** 2 + (screenY - item.CenterY) ** 2
+        if (distance < nearestDistance) {
+            nearest := item
+            nearestDistance := distance
+        }
+    }
+    return nearest.Index
+}
+
+PersistSortOrder() {
+    global SortOrderDirty
+
+    EnsureSafetyBackup()
+    try WriteOrder()
+    catch as err {
+        MsgBox("保存排序失败：`n" err.Message, "错误", "Iconx")
+        return false
+    }
+
+    SortOrderDirty := false
+    return true
 }
 
 SignedWord(value) {
     value &= 0xFFFF
     return value >= 0x8000 ? value - 0x10000 : value
-}
-
-SaveSortOrder(*) {
-    global Snippets, SortWorkingIds, LastClientWidth, LastClientHeight
-
-    EnsureSafetyBackup()
-    byId := Map()
-    for snippet in Snippets
-        byId[snippet.Id] := snippet
-
-    reordered := []
-    for id in SortWorkingIds {
-        if byId.Has(id)
-            reordered.Push(byId[id])
-    }
-    Snippets := reordered
-
-    try WriteOrder()
-    catch as err {
-        MsgBox("保存排序失败：`n" err.Message, "错误", "Iconx")
-        return
-    }
-
-    CloseSortMode()
-    LayoutCards(LastClientWidth, LastClientHeight)
-    ShowTemporaryStatus("文本顺序已保存")
-}
-
-CloseSortMode(*) {
-    global SortGui, SortList, SortDragFrom, SortDragTo
-
-    SortDragFrom := 0
-    SortDragTo := 0
-    try DllCall("ReleaseCapture")
-    try SortGui.Destroy()
-    SortGui := ""
-    SortList := ""
 }
 
 GetButtonLabel(snippet) {
@@ -954,7 +952,10 @@ GetOneLinePreview(text, maxLength := 60) {
 }
 
 PasteSnippet(snippet, *) {
-    global LastTargetHwnd, MainGui
+    global LastTargetHwnd, MainGui, SortModeActive
+
+    if SortModeActive
+        return
 
     A_Clipboard := snippet.Content
     if !ClipWait(0.8) {
@@ -1007,6 +1008,32 @@ EnableDarkControl(control) {
     try DllCall("uxtheme\SetWindowTheme", "Ptr", control.Hwnd, "Str", "DarkMode_Explorer", "Ptr", 0)
 }
 
+EnableDarkEdit(control) {
+    EnableDarkControl(control)
+    try control.BackColor := "2B2D31"
+    try control.SetFont("s10 cE8EAED", "Microsoft YaHei UI")
+    RegisterDarkEdit(control)
+}
+
+RegisterDarkEdit(control) {
+    global DarkEditHandles, DarkEditBrush
+
+    DarkEditHandles[control.Hwnd] := true
+    if !DarkEditBrush
+        DarkEditBrush := DllCall("gdi32\CreateSolidBrush", "UInt", 0x00312D2B, "Ptr")
+}
+
+HandleEditControlColor(wParam, lParam, msg, hwnd) {
+    global DarkEditHandles, DarkEditBrush
+
+    if !DarkEditHandles.Has(lParam)
+        return
+
+    DllCall("gdi32\SetTextColor", "Ptr", wParam, "UInt", 0x00EDEAE8)
+    DllCall("gdi32\SetBkColor", "Ptr", wParam, "UInt", 0x00312D2B)
+    return DarkEditBrush
+}
+
 ChangePage(offset, *) {
     global CurrentPage, LastClientWidth, LastClientHeight
 
@@ -1027,7 +1054,7 @@ MainGuiSize(guiObj, minMax, width, height) {
 
 LayoutCards(width, height) {
     global Snippets, CurrentPage, AddButton, SortButton, TrashButton, SettingsButton
-    global PrevButton, NextButton, StatusText, EmptyText
+    global PrevButton, NextButton, StatusText, EmptyText, SortModeActive
 
     margin := 20
     gap := 16
@@ -1077,7 +1104,9 @@ LayoutCards(width, height) {
     if EmptyText.Visible
         EmptyText.Move(margin, top + 40, width - margin * 2, 80)
 
-    if (Snippets.Length = 0)
+    if SortModeActive
+        StatusText.Text := "排序模式 · 直接拖动文本按钮调整顺序"
+    else if (Snippets.Length = 0)
         StatusText.Text := "尚未保存文本"
     else if (totalPages = 1)
         StatusText.Text := Snippets.Length " 个文本段 · 左键粘贴，右键管理"
