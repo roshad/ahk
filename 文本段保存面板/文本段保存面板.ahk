@@ -4,6 +4,7 @@ Persistent
 
 global MainGui := ""
 global AddButton := ""
+global NewGroupButton := ""
 global SortButton := ""
 global TrashButton := ""
 global SettingsButton := ""
@@ -21,6 +22,7 @@ global SettingsPath := A_ScriptDir "\文本段保存面板设置.ini"
 global StorageRoot := A_ScriptDir
 global DataDir := ""
 global OrderPath := ""
+global LayoutPath := ""
 global TrashDir := ""
 global BackupDir := ""
 global SafetyBackupMade := false
@@ -29,15 +31,29 @@ global SortDragFrom := 0
 global SortDragTo := 0
 global SortDragMoved := false
 global SortOrderDirty := false
+global SortDragType := ""
+global SortDragId := ""
+global SortDropMessage := ""
+global SortLastTargetKey := ""
+global Groups := []
+global GroupById := Map()
+global RootItems := []
+global SnippetById := Map()
+global GroupControlToGroup := Map()
+global UngroupedPanel := ""
+global UngroupedTitle := ""
+global LayoutRegions := []
 global DarkEditHandles := Map()
 global DarkEditBrush := 0
+global LastContextMenuTick := 0
+global LastContextMenuHwnd := 0
 
 Initialize()
 
 !+v::ToggleMainGui()
 
 Initialize() {
-    global MainGui, AddButton, SortButton, TrashButton, SettingsButton, PrevButton, NextButton
+    global MainGui, AddButton, NewGroupButton, SortButton, TrashButton, SettingsButton, PrevButton, NextButton
     global StatusText, EmptyText, DataDir, TrashDir, BackupDir
 
     LoadStorageSettings()
@@ -52,11 +68,13 @@ Initialize() {
     MainGui.SetFont("s10 cE8EAED", "Microsoft YaHei UI")
 
     AddButton := MainGui.AddButton("x20 y18 w140 h42 Default", "+ 添加文本")
-    SortButton := MainGui.AddButton("x170 y22 w88 h34", "排序")
-    TrashButton := MainGui.AddButton("x268 y22 w88 h34", "回收站")
-    SettingsButton := MainGui.AddButton("x366 y22 w88 h34", "存储位置")
+    NewGroupButton := MainGui.AddButton("x170 y22 w96 h34", "+ 分组")
+    SortButton := MainGui.AddButton("x274 y22 w88 h34", "排序")
+    TrashButton := MainGui.AddButton("x370 y22 w88 h34", "回收站")
+    SettingsButton := MainGui.AddButton("x466 y22 w100 h34", "存储位置")
     AddButton.SetFont("s11 Bold", "Microsoft YaHei UI")
     AddButton.OnEvent("Click", OpenAddDialog)
+    NewGroupButton.OnEvent("Click", OpenCreateGroup)
     SortButton.OnEvent("Click", ToggleSortMode)
     TrashButton.OnEvent("Click", OpenTrashManager)
     SettingsButton.OnEvent("Click", ChooseStorageLocation)
@@ -72,9 +90,11 @@ Initialize() {
     EmptyText := MainGui.AddText("x20 y100 w700 h80 Center +0x200", "还没有保存文本。`n点击“添加文本”创建第一条内容。")
     EmptyText.SetFont("s14 c8AB4F8", "Microsoft YaHei UI")
 
+    CreateUngroupedControls()
+    CreateGroupControls()
     CreateSnippetButtons()
     EnableDarkWindow(MainGui)
-    for control in [AddButton, SortButton, TrashButton, SettingsButton, PrevButton, NextButton]
+    for control in [AddButton, NewGroupButton, SortButton, TrashButton, SettingsButton, PrevButton, NextButton]
         EnableDarkControl(control)
 
     MainGui.OnEvent("Size", MainGuiSize)
@@ -83,6 +103,7 @@ Initialize() {
 
     ConfigureTrayMenu()
     OnMessage(0x007B, HandleContextMenu)
+    OnMessage(0x0205, HandleRightButtonUp)
     OnMessage(0x0201, SortMouseDown)
     OnMessage(0x0200, SortMouseMove)
     OnMessage(0x0202, SortMouseUp)
@@ -131,11 +152,12 @@ LoadStorageSettings() {
 }
 
 SetStoragePaths(root) {
-    global StorageRoot, DataDir, OrderPath, TrashDir, BackupDir
+    global StorageRoot, DataDir, OrderPath, LayoutPath, TrashDir, BackupDir
 
     StorageRoot := NormalizeStorageRoot(root)
     DataDir := StorageRoot "\文本段保存面板数据"
     OrderPath := DataDir "\order.txt"
+    LayoutPath := DataDir "\layout.ini"
     TrashDir := StorageRoot "\文本段保存面板回收站"
     BackupDir := StorageRoot "\文本段保存面板备份"
 }
@@ -245,11 +267,11 @@ HideMainGui(*) {
 }
 
 LoadSnippets() {
-    global Snippets, DataDir, OrderPath
+    global Snippets, DataDir, OrderPath, LayoutPath, SnippetById
+    global Groups, GroupById, RootItems
 
-    discovered := []
-    byId := Map()
-
+    Snippets := []
+    SnippetById := Map()
     Loop Files, DataDir "\*.txt", "F" {
         if (A_LoopFileName = "order.txt")
             continue
@@ -273,13 +295,25 @@ LoadSnippets() {
             Id: id,
             Title: Trim(title, " `t`r`n"),
             Content: content,
+            GroupId: "",
             Button: ""
         }
-        discovered.Push(snippet)
-        byId[id] := snippet
+        Snippets.Push(snippet)
+        SnippetById[id] := snippet
     }
 
-    Snippets := []
+    Groups := []
+    GroupById := Map()
+    RootItems := []
+    if FileExist(LayoutPath)
+        LoadLayoutFile()
+    else
+        LoadLegacyLayout()
+}
+
+LoadLegacyLayout() {
+    global Snippets, SnippetById, RootItems, OrderPath
+
     seen := Map()
     if FileExist(OrderPath) {
         try orderText := FileRead(OrderPath, "UTF-8")
@@ -288,28 +322,305 @@ LoadSnippets() {
 
         for line in StrSplit(StrReplace(orderText, "`r", ""), "`n") {
             id := Trim(line)
-            if (id != "" && byId.Has(id) && !seen.Has(id)) {
-                Snippets.Push(byId[id])
+            if (id != "" && SnippetById.Has(id) && !seen.Has(id)) {
+                RootItems.Push("s:" id)
                 seen[id] := true
             }
         }
     }
 
-    for snippet in discovered {
-        if !seen.Has(snippet.Id) {
-            Snippets.Push(snippet)
-            seen[snippet.Id] := true
+    for snippet in Snippets {
+        if !seen.Has(snippet.Id)
+            RootItems.Push("s:" snippet.Id)
+    }
+}
+
+LoadLayoutFile() {
+    global LayoutPath, Snippets, SnippetById, Groups, GroupById, RootItems
+    global OrderPath
+
+    raw := ""
+    try raw := FileRead(LayoutPath, "UTF-8")
+    catch {
+        LoadLegacyLayout()
+        return
+    }
+
+    records := Map()
+    section := ""
+    rootItemsText := ""
+    for line in StrSplit(StrReplace(raw, "`r", ""), "`n") {
+        line := Trim(line)
+        if (line = "" || SubStr(line, 1, 1) = ";")
+            continue
+        if RegExMatch(line, "^\[(.+)\]$", &sectionMatch) {
+            section := sectionMatch[1]
+            continue
+        }
+        if !RegExMatch(line, "^([^=]+)=(.*)$", &valueMatch)
+            continue
+
+        key := Trim(valueMatch[1])
+        value := valueMatch[2]
+        if (section = "Root" && key = "Items") {
+            rootItemsText := value
+            continue
+        }
+        if RegExMatch(section, "^Group\.(.+)$", &groupMatch) {
+            id := groupMatch[1]
+            if !records.Has(id)
+                records[id] := Map()
+            records[id][key] := value
+        }
+    }
+
+    for id, record in records {
+        group := {
+            Id: id,
+            Title: DecodeLayoutValue(record.Has("Title") ? record["Title"] : "未命名分组"),
+            ParentId: DecodeLayoutValue(record.Has("ParentId") ? record["ParentId"] : ""),
+            Rows: ParsePositiveInt(record.Has("Rows") ? record["Rows"] : "2", 2),
+            Cols: ParsePositiveInt(record.Has("Cols") ? record["Cols"] : "2", 2),
+            Items: [],
+            Frame: "",
+            TitleControl: "",
+            MenuButton: ""
+        }
+        if record.Has("Items")
+            group.Items := ParseLayoutItems(record["Items"])
+        Groups.Push(group)
+        GroupById[id] := group
+    }
+
+    usedSnippets := Map()
+    usedGroups := Map()
+    RootItems := []
+    for token in ParseLayoutItems(rootItemsText) {
+        if (SubStr(token, 1, 2) = "s:" && SnippetById.Has(SubStr(token, 3))) {
+            id := SubStr(token, 3)
+            if !usedSnippets.Has(id) {
+                RootItems.Push(token)
+                usedSnippets[id] := true
+            }
+        } else if (SubStr(token, 1, 2) = "g:" && GroupById.Has(SubStr(token, 3))) {
+            id := SubStr(token, 3)
+            if !usedGroups.Has(id) {
+                RootItems.Push(token)
+                usedGroups[id] := true
+            }
+        }
+    }
+
+    for group in Groups {
+        filtered := []
+        for token in group.Items {
+            if (SubStr(token, 1, 2) = "s:" && SnippetById.Has(SubStr(token, 3))) {
+                id := SubStr(token, 3)
+                if !usedSnippets.Has(id) {
+                    filtered.Push(token)
+                    usedSnippets[id] := true
+                    SnippetById[id].GroupId := group.Id
+                }
+            } else if (SubStr(token, 1, 2) = "g:" && GroupById.Has(SubStr(token, 3))) {
+                childId := SubStr(token, 3)
+                if !usedGroups.Has(childId) {
+                    filtered.Push(token)
+                    usedGroups[childId] := true
+                    GroupById[childId].ParentId := group.Id
+                }
+            }
+        }
+        group.Items := filtered
+    }
+
+    for snippet in Snippets {
+        if !usedSnippets.Has(snippet.Id)
+            RootItems.Push("s:" snippet.Id)
+    }
+    for group in Groups {
+        if !usedGroups.Has(group.Id)
+            RootItems.Push("g:" group.Id)
+    }
+}
+
+ParseLayoutItems(text) {
+    items := []
+    for value in StrSplit(text, "|") {
+        value := Trim(value)
+        if (value != "")
+            items.Push(value)
+    }
+    return items
+}
+
+ParseNonNegativeInt(value, fallback) {
+    value := Trim(value)
+    if !RegExMatch(value, "^\d+$")
+        return fallback
+
+    number := value + 0
+    return number >= 0 ? number : fallback
+}
+
+ParsePositiveInt(value, fallback) {
+    value := Trim(value)
+    if !RegExMatch(value, "^\d+$")
+        return fallback
+
+    number := value + 0
+    return number > 0 ? number : fallback
+}
+
+EncodeLayoutValue(value) {
+    slash := Chr(92)
+    value := StrReplace(value, "`r`n", "`n")
+    value := StrReplace(value, "`r", "`n")
+    value := StrReplace(value, slash, slash . slash)
+    value := StrReplace(value, "`n", slash . "n")
+    return value
+}
+
+DecodeLayoutValue(value) {
+    slash := Chr(92)
+    placeholder := Chr(1)
+    value := StrReplace(value, slash . slash, placeholder)
+    value := StrReplace(value, slash . "n", "`n")
+    return StrReplace(value, placeholder, slash)
+}
+
+JoinLayoutItems(items) {
+    result := ""
+    for token in items
+        result .= (result = "" ? "" : "|") token
+    return result
+}
+
+WriteLayout() {
+    global LayoutPath, RootItems, Groups
+
+    text := "[Meta]`nVersion=1`n`n[Root]`nItems=" JoinLayoutItems(RootItems) "`n"
+    for group in Groups {
+        text .= "`n[Group." group.Id "]`n"
+        text .= "Title=" EncodeLayoutValue(group.Title) "`n"
+        text .= "ParentId=" EncodeLayoutValue(group.ParentId) "`n"
+        text .= "Rows=" group.Rows "`n"
+        text .= "Cols=" group.Cols "`n"
+        text .= "Items=" JoinLayoutItems(group.Items) "`n"
+    }
+    WriteTextAtomic(LayoutPath, text)
+    WriteLegacyOrder()
+}
+
+WriteLegacyOrder() {
+    global Snippets, OrderPath, RootItems, Groups
+
+    ids := []
+    seen := Map()
+    AppendSnippetIds(RootItems, ids, seen)
+    for group in Groups {
+        AppendSnippetIds(group.Items, ids, seen)
+    }
+
+    text := ""
+    for id in ids
+        text .= id "`n"
+    WriteTextAtomic(OrderPath, RTrim(text, "`n"))
+}
+
+AppendSnippetIds(items, ids, seen) {
+    global SnippetById, GroupById
+
+    for token in items {
+        type := SubStr(token, 1, 2)
+        id := SubStr(token, 3)
+        if (type = "s:" && SnippetById.Has(id) && !seen.Has(id)) {
+            ids.Push(id)
+            seen[id] := true
+        } else if (type = "g:" && GroupById.Has(id)) {
+            AppendSnippetIds(GroupById[id].Items, ids, seen)
         }
     }
 }
 
-WriteOrder() {
-    global Snippets, OrderPath
+GetUngroupedTokens() {
+    global RootItems
 
-    text := ""
-    for snippet in Snippets
-        text .= snippet.Id "`n"
-    WriteTextAtomic(OrderPath, RTrim(text, "`n"))
+    tokens := []
+    for token in RootItems {
+        if (SubStr(token, 1, 2) = "s:")
+            tokens.Push(token)
+    }
+    return tokens
+}
+
+FindTokenIndex(items, token) {
+    for index, value in items {
+        if (value = token)
+            return index
+    }
+    return 0
+}
+
+RemoveTokenFromLayout(token) {
+    global RootItems, Groups
+
+    index := FindTokenIndex(RootItems, token)
+    if index {
+        RootItems.RemoveAt(index)
+        return true
+    }
+    for group in Groups {
+        index := FindTokenIndex(group.Items, token)
+        if index {
+            group.Items.RemoveAt(index)
+            return true
+        }
+    }
+    return false
+}
+
+FindSnippetLocation(id) {
+    global SnippetById, RootItems, Groups
+
+    token := "s:" id
+    if FindTokenIndex(RootItems, token)
+        return {GroupId: "", Items: RootItems}
+    for group in Groups {
+        if FindTokenIndex(group.Items, token)
+            return {GroupId: group.Id, Items: group.Items}
+    }
+    return 0
+}
+
+FindGroupLocation(id) {
+    global RootItems, Groups
+
+    token := "g:" id
+    if FindTokenIndex(RootItems, token)
+        return {ParentId: "", Items: RootItems}
+    for group in Groups {
+        if FindTokenIndex(group.Items, token)
+            return {ParentId: group.Id, Items: group.Items}
+    }
+    return 0
+}
+
+InsertSnippetIntoGroup(snippet, group) {
+    token := "s:" snippet.Id
+    RemoveTokenFromLayout(token)
+    group.Items.Push(token)
+    snippet.GroupId := group.Id
+}
+
+InsertSnippetIntoRoot(snippet) {
+    token := "s:" snippet.Id
+    RemoveTokenFromLayout(token)
+    RootItems.Push(token)
+    snippet.GroupId := ""
+}
+
+WriteOrder() {
+    WriteLayout()
 }
 
 WriteTextAtomic(path, content) {
@@ -431,6 +742,44 @@ CreateSnippetButtons() {
         CreateButtonForSnippet(snippet)
 }
 
+CreateUngroupedControls() {
+    global MainGui, UngroupedPanel, UngroupedTitle, GroupControlToGroup
+
+    UngroupedPanel := MainGui.AddText("Hidden +Border", "")
+    UngroupedPanel.BackColor := "202124"
+    EnableDarkControl(UngroupedPanel)
+    UngroupedTitle := MainGui.AddText("Hidden", "未分组")
+    UngroupedTitle.SetFont("s10 Bold c8AB4F8", "Microsoft YaHei UI")
+    EnableDarkControl(UngroupedTitle)
+    GroupControlToGroup[UngroupedPanel.Hwnd] := {Type: "root"}
+    GroupControlToGroup[UngroupedTitle.Hwnd] := {Type: "root"}
+}
+
+CreateGroupControls() {
+    global Groups
+
+    for group in Groups
+        CreateGroupControlsFor(group)
+}
+
+CreateGroupControlsFor(group) {
+    global MainGui, GroupControlToGroup
+
+    group.Frame := MainGui.AddText("Hidden +Border", "")
+    group.Frame.BackColor := "202124"
+    EnableDarkControl(group.Frame)
+    group.TitleControl := MainGui.AddText("Hidden", group.Title)
+    group.TitleControl.SetFont("s10 Bold c8AB4F8", "Microsoft YaHei UI")
+    EnableDarkControl(group.TitleControl)
+    group.MenuButton := MainGui.AddButton("Hidden", "操作")
+    group.MenuButton.SetFont("s9", "Microsoft YaHei UI")
+    group.MenuButton.OnEvent("Click", OpenGroupMenu.Bind(group.Id))
+    EnableDarkControl(group.MenuButton)
+    GroupControlToGroup[group.Frame.Hwnd] := {Type: "group", Id: group.Id}
+    GroupControlToGroup[group.TitleControl.Hwnd] := {Type: "group", Id: group.Id}
+    GroupControlToGroup[group.MenuButton.Hwnd] := {Type: "group", Id: group.Id}
+}
+
 CreateButtonForSnippet(snippet) {
     global MainGui, ButtonToSnippet
 
@@ -440,6 +789,178 @@ CreateButtonForSnippet(snippet) {
     EnableDarkControl(button)
     snippet.Button := button
     ButtonToSnippet[button.Hwnd] := snippet
+}
+
+CreateGroupFromDialog(*) {
+    global Groups, GroupById, RootItems, CurrentPage, LastClientWidth, LastClientHeight, SortModeActive
+
+    if SortModeActive {
+        ShowTemporaryStatus("请先退出排序模式")
+        return
+    }
+
+    result := InputBox("输入分组名称：", "新建分组", "w360 h140")
+    if (result.Result != "OK")
+        return
+    title := Trim(result.Value)
+    if (title = "")
+        title := "未命名分组"
+
+    EnsureSafetyBackup()
+
+    id := "group-" FormatTime(, "yyyyMMdd-HHmmss") "-" A_TickCount "-" Random(1000, 9999)
+    rows := 2
+    cols := 2
+    if !GroupSizeFitsPage(rows, cols, LastClientWidth, LastClientHeight) {
+        rows := 1
+        if !GroupSizeFitsPage(rows, cols, LastClientWidth, LastClientHeight)
+            cols := 1
+    }
+
+    group := {
+        Id: id,
+        Title: title,
+        ParentId: "",
+        Rows: rows,
+        Cols: cols,
+        Items: [],
+        Frame: "",
+        TitleControl: "",
+        MenuButton: ""
+    }
+    Groups.Push(group)
+    GroupById[id] := group
+    RootItems.Push("g:" id)
+    CreateGroupControlsFor(group)
+    WriteLayout()
+    CurrentPage := 999999
+    LayoutCards(LastClientWidth, LastClientHeight)
+    ShowTemporaryStatus("分组已创建（" rows "×" cols "）")
+}
+
+OpenCreateGroup(*) {
+    CreateGroupFromDialog()
+}
+
+OpenRenameGroup(groupId, *) {
+    global GroupById
+
+    if !GroupById.Has(groupId)
+        return
+    group := GroupById[groupId]
+    result := InputBox("输入新的分组名称：", "重命名分组", "w360 h140", group.Title)
+    if (result.Result != "OK")
+        return
+    title := Trim(result.Value)
+    if (title = "")
+        title := "未命名分组"
+    EnsureSafetyBackup()
+    group.Title := title
+    group.TitleControl.Text := title
+    WriteLayout()
+    ShowTemporaryStatus("分组已重命名")
+}
+
+OpenGroupGridSettings(groupId, *) {
+    global GroupById, LastClientWidth, LastClientHeight
+
+    if !GroupById.Has(groupId)
+        return
+    group := GroupById[groupId]
+    rowsResult := InputBox("输入行数（正整数）：", "设置分组网格", "w360 h140", group.Rows)
+    if (rowsResult.Result != "OK")
+        return
+    colsResult := InputBox("输入列数（正整数）：", "设置分组网格", "w360 h140", group.Cols)
+    if (colsResult.Result != "OK")
+        return
+
+    rows := ParsePositiveInt(rowsResult.Value, 0)
+    cols := ParsePositiveInt(colsResult.Value, 0)
+    if (!rows || !cols) {
+        MsgBox("行数和列数必须是正整数。", "设置分组网格", "Icon!")
+        return
+    }
+
+    if (rows * cols < CountGroupSnippets(group)) {
+        MsgBox("网格容量不足，当前分组有 " CountGroupSnippets(group) " 个文本。", "设置分组网格", "Icon!")
+        return
+    }
+
+    if !GroupSizeFitsPage(rows, cols, LastClientWidth, LastClientHeight) {
+        MsgBox("该网格尺寸超出当前分页可显示范围。", "设置分组网格", "Icon!")
+        return
+    }
+
+    EnsureSafetyBackup()
+    group.Rows := rows
+    group.Cols := cols
+    WriteLayout()
+    LayoutCards(LastClientWidth, LastClientHeight)
+    ShowTemporaryStatus("分组网格已更新")
+}
+
+CountGroupSnippets(group) {
+    count := 0
+    for token in group.Items {
+        if (SubStr(token, 1, 2) = "s:")
+            count += 1
+    }
+    return count
+}
+
+DeleteGroup(groupId, *) {
+    global GroupById, Groups, RootItems, SnippetById, GroupControlToGroup, LastClientWidth, LastClientHeight
+
+    if !GroupById.Has(groupId)
+        return
+    group := GroupById[groupId]
+    if (MsgBox("删除分组后，里面的文本会移到未分组区域。`n`n确定删除“" group.Title "”吗？", "删除分组", "YesNo Icon!") != "Yes")
+        return
+
+    EnsureSafetyBackup()
+    location := FindGroupLocation(groupId)
+    if !IsObject(location)
+        return
+    insertAt := FindTokenIndex(location.Items, "g:" groupId)
+    if !insertAt
+        insertAt := location.Items.Length + 1
+    else
+        location.Items.RemoveAt(insertAt)
+
+    moved := []
+    for token in group.Items {
+        if (SubStr(token, 1, 2) = "s:") {
+            id := SubStr(token, 3)
+            if SnippetById.Has(id) {
+                SnippetById[id].GroupId := location.ParentId
+                moved.Push(token)
+            }
+        } else if (SubStr(token, 1, 2) = "g:" && GroupById.Has(SubStr(token, 3))) {
+            childId := SubStr(token, 3)
+            GroupById[childId].ParentId := location.ParentId
+            moved.Push(token)
+        }
+    }
+    for index, token in moved
+        location.Items.InsertAt(Min(insertAt + index - 1, location.Items.Length + 1), token)
+
+    for index, candidate in Groups {
+        if (candidate.Id = groupId) {
+            Groups.RemoveAt(index)
+            break
+        }
+    }
+    GroupById.Delete(groupId)
+    GroupControlToGroup.Delete(group.Frame.Hwnd)
+    GroupControlToGroup.Delete(group.TitleControl.Hwnd)
+    GroupControlToGroup.Delete(group.MenuButton.Hwnd)
+    try group.Frame.Destroy()
+    try group.TitleControl.Destroy()
+    try group.MenuButton.Destroy()
+    WriteLayout()
+    LayoutCards(LastClientWidth, LastClientHeight)
+    destination := location.ParentId = "" ? "未分组" : "父分组"
+    ShowTemporaryStatus("分组已删除，内容已移到" destination)
 }
 
 OpenAddDialog(*) {
@@ -482,7 +1003,7 @@ OpenSnippetDialog(snippet := 0) {
 }
 
 SaveSnippetFromDialog(dialog, snippet, *) {
-    global Snippets, CurrentPage, DataDir, LastClientWidth, LastClientHeight
+    global Snippets, CurrentPage, DataDir, LastClientWidth, LastClientHeight, SnippetById, RootItems
 
     values := dialog.Submit(false)
     title := Trim(values.Title)
@@ -499,8 +1020,8 @@ SaveSnippetFromDialog(dialog, snippet, *) {
         return
     }
 
+    EnsureSafetyBackup()
     if editing {
-        EnsureSafetyBackup()
         id := snippet.Id
     } else {
         id := FormatTime(, "yyyyMMdd-HHmmss") "-" A_TickCount "-" Random(1000, 9999)
@@ -526,8 +1047,10 @@ SaveSnippetFromDialog(dialog, snippet, *) {
         snippet.Button.Text := GetButtonLabel(snippet)
         message := "文本已更新"
     } else {
-        snippet := {Id: id, Title: title, Content: content, Button: ""}
+        snippet := {Id: id, Title: title, Content: content, GroupId: "", Button: ""}
         Snippets.Push(snippet)
+        SnippetById[id] := snippet
+        RootItems.Push("s:" id)
         CreateButtonForSnippet(snippet)
         WriteOrder()
         CurrentPage := 999999
@@ -544,10 +1067,8 @@ CloseDialog(dialog, *) {
 }
 
 HandleContextMenu(wParam, lParam, msg, hwnd) {
-    global ButtonToSnippet
-
     controlHwnd := wParam
-    if !controlHwnd || !ButtonToSnippet.Has(controlHwnd)
+    if !controlHwnd
         return
 
     if ((lParam & 0xFFFFFFFF) = 0xFFFFFFFF)
@@ -557,16 +1078,63 @@ HandleContextMenu(wParam, lParam, msg, hwnd) {
         y := SignedWord((lParam >> 16) & 0xFFFF)
     }
 
-    snippet := ButtonToSnippet[controlHwnd]
-    contextMenu := Menu()
-    contextMenu.Add("编辑(&E)", OpenEditDialog.Bind(snippet))
-    contextMenu.Add("删除(&D)", DeleteSnippet.Bind(snippet))
-    contextMenu.Show(x, y)
+    ShowControlContextMenu(controlHwnd, x, y)
     return 0
 }
 
+HandleRightButtonUp(wParam, lParam, msg, hwnd) {
+    global ButtonToSnippet, GroupControlToGroup
+
+    MouseGetPos(&x, &y, &windowHwnd, &controlHwnd)
+    if !controlHwnd
+        controlHwnd := hwnd
+    if !ButtonToSnippet.Has(controlHwnd) && !GroupControlToGroup.Has(controlHwnd)
+        return
+
+    ShowControlContextMenu(controlHwnd, x, y)
+    return 0
+}
+
+ShowControlContextMenu(controlHwnd, x, y) {
+    global ButtonToSnippet, GroupControlToGroup, LastContextMenuTick, LastContextMenuHwnd
+
+    if !controlHwnd
+        return false
+    if (LastContextMenuHwnd = controlHwnd && A_TickCount - LastContextMenuTick < 250)
+        return true
+
+    contextMenu := Menu()
+    if ButtonToSnippet.Has(controlHwnd) {
+        snippet := ButtonToSnippet[controlHwnd]
+        contextMenu.Add("编辑(&E)", OpenEditDialog.Bind(snippet))
+        contextMenu.Add("删除(&D)", DeleteSnippet.Bind(snippet))
+    } else if GroupControlToGroup.Has(controlHwnd) {
+        target := GroupControlToGroup[controlHwnd]
+        if (target.Type != "group")
+            return false
+        contextMenu.Add("重命名分组(&R)", OpenRenameGroup.Bind(target.Id))
+        contextMenu.Add("设置网格(&G)", OpenGroupGridSettings.Bind(target.Id))
+        contextMenu.Add("删除分组(&D)", DeleteGroup.Bind(target.Id))
+    } else {
+        return false
+    }
+    LastContextMenuHwnd := controlHwnd
+    LastContextMenuTick := A_TickCount
+    contextMenu.Show(x, y)
+    return true
+}
+
+OpenGroupMenu(groupId, *) {
+    global GroupById, SortModeActive
+
+    if SortModeActive || !GroupById.Has(groupId)
+        return
+    MouseGetPos(&x, &y)
+    ShowControlContextMenu(GroupById[groupId].MenuButton.Hwnd, x, y)
+}
+
 DeleteSnippet(snippet, *) {
-    global Snippets, DataDir, TrashDir, ButtonToSnippet, LastClientWidth, LastClientHeight
+    global Snippets, DataDir, TrashDir, ButtonToSnippet, LastClientWidth, LastClientHeight, SnippetById
 
     displayName := snippet.Title != "" ? snippet.Title : GetOneLinePreview(snippet.Content, 36)
     if (MsgBox("确定删除以下文本吗？`n`n" displayName "`n`n删除后可从应用回收站恢复。", "删除文本", "YesNo Icon!") != "Yes")
@@ -590,6 +1158,10 @@ DeleteSnippet(snippet, *) {
             FileMove(titlePath, itemDir "\title.txt")
         IniWrite(snippet.Id, itemDir "\meta.ini", "Trash", "Id")
         IniWrite(index, itemDir "\meta.ini", "Trash", "OriginalIndex")
+        IniWrite(snippet.GroupId, itemDir "\meta.ini", "Trash", "GroupId")
+        location := FindSnippetLocation(snippet.Id)
+        groupIndex := location ? FindTokenIndex(location.Items, "s:" snippet.Id) : 0
+        IniWrite(groupIndex, itemDir "\meta.ini", "Trash", "GroupIndex")
         IniWrite(FormatTime(, "yyyy-MM-dd HH:mm:ss"), itemDir "\meta.ini", "Trash", "DeletedAt")
     } catch as err {
         try {
@@ -603,8 +1175,10 @@ DeleteSnippet(snippet, *) {
         return
     }
 
+    RemoveTokenFromLayout("s:" snippet.Id)
     snippet.Button.Visible := false
     ButtonToSnippet.Delete(snippet.Button.Hwnd)
+    SnippetById.Delete(snippet.Id)
     Snippets.RemoveAt(index)
     WriteOrder()
     LayoutCards(LastClientWidth, LastClientHeight)
@@ -700,7 +1274,7 @@ GetSelectedTrash(list) {
 }
 
 RestoreSelectedTrash(trashGui, list, *) {
-    global Snippets, DataDir, LastClientWidth, LastClientHeight
+    global Snippets, DataDir, LastClientWidth, LastClientHeight, SnippetById, RootItems, GroupById
 
     selected := GetSelectedTrash(list)
     if !IsObject(selected) {
@@ -721,9 +1295,19 @@ RestoreSelectedTrash(trashGui, list, *) {
     try title := FileRead(itemDir "\title.txt", "UTF-8")
     catch
         title := ""
-    try originalIndex := IniRead(itemDir "\meta.ini", "Trash", "OriginalIndex", Snippets.Length + 1) + 0
+    try originalIndexValue := IniRead(itemDir "\meta.ini", "Trash", "OriginalIndex", "")
     catch
-        originalIndex := Snippets.Length + 1
+        originalIndexValue := ""
+    originalIndex := ParsePositiveInt(originalIndexValue, Snippets.Length + 1)
+    try originalGroupId := IniRead(itemDir "\meta.ini", "Trash", "GroupId", "")
+    catch
+        originalGroupId := ""
+    try originalGroupIndexValue := IniRead(itemDir "\meta.ini", "Trash", "GroupIndex", "")
+    catch
+        originalGroupIndexValue := ""
+    originalGroupIndex := ParseNonNegativeInt(originalGroupIndexValue, 0)
+
+    EnsureSafetyBackup()
 
     try {
         FileMove(itemDir "\content.txt", DataDir "\" id ".txt")
@@ -735,9 +1319,19 @@ RestoreSelectedTrash(trashGui, list, *) {
         return
     }
 
-    snippet := {Id: id, Title: Trim(title), Content: content, Button: ""}
+    snippet := {Id: id, Title: Trim(title), Content: content, GroupId: "", Button: ""}
     insertAt := Max(1, Min(originalIndex, Snippets.Length + 1))
     Snippets.InsertAt(insertAt, snippet)
+    SnippetById[id] := snippet
+    if (originalGroupId != "" && GroupById.Has(originalGroupId) && CountGroupSnippets(GroupById[originalGroupId]) < GroupById[originalGroupId].Rows * GroupById[originalGroupId].Cols) {
+        targetGroup := GroupById[originalGroupId]
+        insertAt := Max(1, Min(originalGroupIndex, targetGroup.Items.Length + 1))
+        targetGroup.Items.InsertAt(insertAt, "s:" id)
+        snippet.GroupId := originalGroupId
+    } else {
+        rootInsertAt := (originalGroupId = "" && originalGroupIndex > 0) ? Max(1, Min(originalGroupIndex, RootItems.Length + 1)) : RootItems.Length + 1
+        RootItems.InsertAt(rootInsertAt, "s:" id)
+    }
     CreateButtonForSnippet(snippet)
     WriteOrder()
     FillTrashList(list)
@@ -783,7 +1377,7 @@ EmptyTrash(list, *) {
 }
 
 ToggleSortMode(*) {
-    global SortModeActive, SortButton, SortOrderDirty, Snippets
+    global SortModeActive, SortButton, SortOrderDirty, RootItems, Groups
 
     if SortModeActive {
         if SortOrderDirty && !PersistSortOrder()
@@ -795,8 +1389,8 @@ ToggleSortMode(*) {
         return
     }
 
-    if (Snippets.Length < 2) {
-        ShowTemporaryStatus("至少需要两个文本段才能排序")
+    if (CountLayoutItems() < 2) {
+        ShowTemporaryStatus("至少需要两个文本段或分组才能排序")
         return
     }
 
@@ -806,48 +1400,80 @@ ToggleSortMode(*) {
     ShowTemporaryStatus("排序模式：直接拖动文本按钮调整顺序")
 }
 
+CountLayoutItems() {
+    global RootItems, Groups
+
+    count := 0
+    for token in RootItems
+        if (SubStr(token, 1, 2) = "s:" || SubStr(token, 1, 2) = "g:")
+            count += 1
+    for group in Groups
+        for token in group.Items
+            if (SubStr(token, 1, 2) = "s:" || SubStr(token, 1, 2) = "g:")
+                count += 1
+    return count
+}
+
 SortMouseDown(wParam, lParam, msg, hwnd) {
-    global SortModeActive, SortDragFrom, SortDragTo, SortDragMoved, ButtonToSnippet, MainGui
+    global SortModeActive, SortDragFrom, SortDragTo, SortDragMoved, SortDragType, SortDragId, SortDropMessage, SortLastTargetKey
+    global ButtonToSnippet, GroupControlToGroup, MainGui
 
-    if !SortModeActive || SortDragFrom || !ButtonToSnippet.Has(hwnd)
+    if !SortModeActive || SortDragFrom
         return
 
-    snippet := ButtonToSnippet[hwnd]
-    index := FindSnippetIndex(snippet.Id)
-    if !index
+    if ButtonToSnippet.Has(hwnd) {
+        snippet := ButtonToSnippet[hwnd]
+        SortDragType := "snippet"
+        SortDragId := snippet.Id
+    } else if GroupControlToGroup.Has(hwnd) {
+        target := GroupControlToGroup[hwnd]
+        if (target.Type != "group")
+            return
+        SortDragType := "group"
+        SortDragId := target.Id
+    } else {
         return
+    }
 
-    SortDragFrom := index
-    SortDragTo := index
+    SortDragFrom := 1
+    SortDragTo := 1
     SortDragMoved := false
+    SortDropMessage := ""
+    SortLastTargetKey := ""
     DllCall("SetCapture", "Ptr", MainGui.Hwnd)
     return 0
 }
 
 SortMouseMove(wParam, lParam, msg, hwnd) {
-    global SortModeActive, SortDragFrom, SortDragTo, SortDragMoved, SortOrderDirty
-    global Snippets, LastClientWidth, LastClientHeight
+    global SortModeActive, SortDragFrom, SortDragTo, SortDragMoved, SortOrderDirty, SortDragType, SortDragId, SortLastTargetKey
+    global LastClientWidth, LastClientHeight
 
     if !SortModeActive || !SortDragFrom
         return
 
     MouseGetPos(&screenX, &screenY)
-    target := GetSortTargetIndex(screenX, screenY)
-    if !target || target = SortDragTo
+    target := GetDropTarget(screenX, screenY)
+    if !IsObject(target)
         return 0
+    targetKey := GetDropTargetKey(target)
+    if (targetKey = SortLastTargetKey)
+        return 0
+    SortLastTargetKey := targetKey
 
-    snippet := Snippets.RemoveAt(SortDragFrom)
-    Snippets.InsertAt(target, snippet)
-    SortDragFrom := target
-    SortDragTo := target
-    SortDragMoved := true
-    SortOrderDirty := true
-    LayoutCards(LastClientWidth, LastClientHeight)
+    if (SortDragType = "snippet")
+        moved := MoveSnippetToDropTarget(SortDragId, target)
+    else
+        moved := MoveGroupToDropTarget(SortDragId, target)
+    if moved {
+        SortDragMoved := true
+        SortOrderDirty := true
+        LayoutCards(LastClientWidth, LastClientHeight)
+    }
     return 0
 }
 
 SortMouseUp(wParam, lParam, msg, hwnd) {
-    global SortDragFrom, SortDragTo, SortDragMoved
+    global SortDragFrom, SortDragTo, SortDragMoved, SortDragType, SortDragId, SortDropMessage, SortLastTargetKey
 
     if !SortDragFrom
         return
@@ -857,60 +1483,151 @@ SortMouseUp(wParam, lParam, msg, hwnd) {
     SortDragFrom := 0
     SortDragTo := 0
     SortDragMoved := false
+    SortDragType := ""
+    SortDragId := ""
+    SortLastTargetKey := ""
 
     if moved {
         if PersistSortOrder()
             ShowTemporaryStatus("文本顺序已保存")
         else
             ShowTemporaryStatus("顺序暂未保存，请重试")
+    } else if (SortDropMessage != "") {
+        ShowTemporaryStatus(SortDropMessage)
+    }
+    SortDropMessage := ""
+    return 0
+}
+
+GetDropTarget(screenX, screenY) {
+    global LayoutRegions
+
+    index := LayoutRegions.Length
+    while (index >= 1) {
+        region := LayoutRegions[index]
+        if (screenX >= region.X && screenX < region.X + region.Width && screenY >= region.Y && screenY < region.Y + region.Height)
+            return region
+        index -= 1
     }
     return 0
 }
 
-GetSortTargetIndex(screenX, screenY) {
-    global Snippets
+GetDropTargetKey(target) {
+    id := target.HasOwnProp("Id") ? target.Id : ""
+    groupId := target.HasOwnProp("GroupId") ? target.GroupId : ""
+    return target.Type "|" id "|" groupId
+}
 
-    visible := []
-    for index, snippet in Snippets {
-        if !snippet.Button.Visible
-            continue
+MoveSnippetToDropTarget(id, target) {
+    global SnippetById, GroupById, RootItems, Groups, SortDropMessage
 
-        try WinGetPos(&x, &y, &width, &height, "ahk_id " snippet.Button.Hwnd)
-        catch
-            continue
-        if (width <= 0 || height <= 0)
-            continue
-
-        item := {
-            Index: index,
-            X: x,
-            Y: y,
-            Width: width,
-            Height: height,
-            CenterX: x + width / 2,
-            CenterY: y + height / 2
+    if !SnippetById.Has(id)
+        return false
+    snippet := SnippetById[id]
+    token := "s:" id
+    if (target.Type = "snippet" && target.Id = id)
+        return false
+    if (target.Type = "group") {
+        if !GroupById.Has(target.Id)
+            return false
+        group := GroupById[target.Id]
+        if (snippet.GroupId = group.Id)
+            return false
+        if CountGroupSnippets(group) >= group.Rows * group.Cols {
+            SortDropMessage := "目标分组已满，无法放入"
+            return false
         }
-        visible.Push(item)
-
-        if (screenX >= x && screenX < x + width && screenY >= y && screenY < y + height)
-            return index
-    }
-
-    if !visible.Length
-        return 0
-
-    nearest := visible[1]
-    nearestDistance := (screenX - nearest.CenterX) ** 2 + (screenY - nearest.CenterY) ** 2
-    for index, item in visible {
-        if (index = 1)
-            continue
-        distance := (screenX - item.CenterX) ** 2 + (screenY - item.CenterY) ** 2
-        if (distance < nearestDistance) {
-            nearest := item
-            nearestDistance := distance
+        InsertSnippetIntoGroup(snippet, group)
+    } else if (target.Type = "root") {
+        if (snippet.GroupId = "")
+            return false
+        InsertSnippetIntoRoot(snippet)
+    } else if (target.Type = "snippet") {
+        if (target.GroupId != "" && GroupById.Has(target.GroupId)) {
+            group := GroupById[target.GroupId]
+            if (snippet.GroupId != group.Id && CountGroupSnippets(group) >= group.Rows * group.Cols) {
+                SortDropMessage := "目标分组已满，无法放入"
+                return false
+            }
+            targetToken := "s:" target.Id
+            if (snippet.GroupId = group.Id)
+                moved := MoveTokenRelative(group.Items, token, targetToken)
+            else {
+                RemoveTokenFromLayout(token)
+                index := FindTokenIndex(group.Items, targetToken)
+                if !index
+                    return false
+                group.Items.InsertAt(index, token)
+                moved := true
+            }
+            if !moved
+                return false
+            snippet.GroupId := group.Id
+        } else {
+            if (snippet.GroupId = "")
+                moved := MoveTokenRelative(RootItems, token, "s:" target.Id)
+            else {
+                RemoveTokenFromLayout(token)
+                index := FindTokenIndex(RootItems, "s:" target.Id)
+                if !index
+                    return false
+                RootItems.InsertAt(index, token)
+                moved := true
+            }
+            if !moved
+                return false
+            snippet.GroupId := ""
         }
     }
-    return nearest.Index
+    SortDropMessage := ""
+    return true
+}
+
+MoveTokenRelative(items, token, targetToken) {
+    sourceIndex := FindTokenIndex(items, token)
+    targetIndex := FindTokenIndex(items, targetToken)
+    if (!sourceIndex || !targetIndex || sourceIndex = targetIndex)
+        return false
+
+    items.RemoveAt(sourceIndex)
+    insertAt := targetIndex - (sourceIndex < targetIndex ? 1 : 0)
+    items.InsertAt(insertAt, token)
+    return true
+}
+
+MoveGroupToDropTarget(id, target) {
+    global GroupById, RootItems, SortDropMessage
+
+    if (target.Type != "group" && target.Type != "root" && target.Type != "snippet")
+        return false
+    if !GroupById.Has(id)
+        return false
+    if (target.Type = "group") {
+        if (target.Id = id || !GroupById.Has(target.Id))
+            return false
+        ; A group drop target means sibling reordering, never nesting.
+        if (GroupById[target.Id].ParentId != "")
+            return false
+    }
+    if (target.Type = "snippet" && target.GroupId != "")
+        return false
+    token := "g:" id
+    index := FindTokenIndex(RootItems, token)
+    if !index
+        return false
+    if (target.Type = "snippet" && target.GroupId = "")
+        moved := MoveTokenRelative(RootItems, token, "s:" target.Id)
+    else if (target.Type = "group")
+        moved := MoveTokenRelative(RootItems, token, "g:" target.Id)
+    else {
+        RootItems.RemoveAt(index)
+        RootItems.Push(token)
+        moved := true
+    }
+    if !moved
+        return false
+    SortDropMessage := ""
+    return true
 }
 
 PersistSortOrder() {
@@ -1053,8 +1770,9 @@ MainGuiSize(guiObj, minMax, width, height) {
 }
 
 LayoutCards(width, height) {
-    global Snippets, CurrentPage, AddButton, SortButton, TrashButton, SettingsButton
+    global Snippets, CurrentPage, AddButton, NewGroupButton, SortButton, TrashButton, SettingsButton
     global PrevButton, NextButton, StatusText, EmptyText, SortModeActive
+    global RootItems, GroupById, Groups, UngroupedPanel, UngroupedTitle, LayoutRegions, MainGui
 
     margin := 20
     gap := 16
@@ -1062,56 +1780,236 @@ LayoutCards(width, height) {
     bottom := 20
     targetWidth := 280
     cardHeight := 108
-
     columns := Max(1, Floor((width - margin * 2 + gap) / (targetWidth + gap)))
     cardWidth := Floor((width - margin * 2 - gap * (columns - 1)) / columns)
-    rows := Max(1, Floor((height - top - bottom + gap) / (cardHeight + gap)))
-    pageSize := Max(1, columns * rows)
-    totalPages := Max(1, Ceil(Snippets.Length / pageSize))
-    CurrentPage := Max(1, Min(CurrentPage, totalPages))
+    availableHeight := Max(120, height - top - bottom)
 
     AddButton.Move(margin, 18, 140, 42)
-    SortButton.Move(170, 22, 88, 34)
-    TrashButton.Move(268, 22, 88, 34)
-    SettingsButton.Move(366, 22, 88, 34)
+    NewGroupButton.Move(170, 22, 96, 34)
+    SortButton.Move(274, 22, 88, 34)
+    TrashButton.Move(370, 22, 88, 34)
+    SettingsButton.Move(466, 22, 100, 34)
     NextButton.Move(width - margin - 72, 22, 72, 34)
     PrevButton.Move(width - margin - 152, 22, 72, 34)
-    StatusText.Move(464, 28, Max(100, width - 656), 28)
+    StatusText.Move(574, 28, Max(100, width - 766), 28)
 
+    for snippet in Snippets
+        snippet.Button.Visible := false
+    for group in Groups {
+        group.Frame.Visible := false
+        group.TitleControl.Visible := false
+        group.MenuButton.Visible := false
+    }
+    UngroupedPanel.Visible := false
+    UngroupedTitle.Visible := false
+    LayoutRegions := []
+
+    blocks := BuildLayoutBlocks(width, cardWidth, cardHeight, gap, availableHeight)
+    pages := BuildLayoutPages(blocks, availableHeight, gap, width - margin * 2)
+    totalPages := Max(1, pages.Length)
+    CurrentPage := Max(1, Min(CurrentPage, totalPages))
     PrevButton.Enabled := CurrentPage > 1
     NextButton.Enabled := CurrentPage < totalPages
-    PrevButton.Visible := Snippets.Length > pageSize
-    NextButton.Visible := Snippets.Length > pageSize
+    PrevButton.Visible := totalPages > 1
+    NextButton.Visible := totalPages > 1
 
-    startIndex := (CurrentPage - 1) * pageSize + 1
-    endIndex := Min(Snippets.Length, startIndex + pageSize - 1)
-
-    for index, snippet in Snippets {
-        visible := index >= startIndex && index <= endIndex
-        snippet.Button.Visible := visible
-        if !visible
-            continue
-
-        slot := index - startIndex
-        row := Floor(slot / columns)
-        column := Mod(slot, columns)
-        x := margin + column * (cardWidth + gap)
-        y := top + row * (cardHeight + gap)
-        snippet.Button.Move(x, y, cardWidth, cardHeight)
+    pageBlocks := pages[CurrentPage]
+    WinGetClientPos(&mainX, &mainY, , , "ahk_id " MainGui.Hwnd)
+    cursorY := top
+    for row in pageBlocks {
+        cursorX := margin
+        for block in row.Items {
+            blockWidth := block.HasOwnProp("Width") ? block.Width : width - margin * 2
+            blockWidth := Min(blockWidth, width - margin * 2)
+        if (block.Type = "root") {
+            rootHeight := block.Height
+            UngroupedPanel.Move(cursorX, cursorY, blockWidth, rootHeight)
+            UngroupedTitle.Move(cursorX + 12, cursorY + 6, blockWidth - 24, 24)
+            UngroupedPanel.Visible := true
+            UngroupedTitle.Visible := true
+            LayoutRegions.Push({Type: "root", Id: "", X: mainX + cursorX, Y: mainY + cursorY, Width: blockWidth, Height: rootHeight})
+            if !block.DropOnly
+                LayoutRootItems(block.Tokens, cursorX + 12, cursorY + 34, blockWidth - 24, cardWidth, cardHeight, gap, mainX, mainY)
+        } else if (block.Type = "group" && GroupById.Has(block.Id)) {
+            group := GroupById[block.Id]
+            groupWidth := blockWidth
+            group.Frame.Move(cursorX, cursorY, groupWidth, block.Height)
+            group.TitleControl.Move(cursorX + 12, cursorY + 6, Max(60, groupWidth - 82), 24)
+            group.MenuButton.Move(cursorX + groupWidth - 58, cursorY + 5, 46, 26)
+            group.Frame.Visible := true
+            group.TitleControl.Visible := true
+            group.MenuButton.Visible := true
+            LayoutRegions.Push({Type: "group", Id: group.Id, X: mainX + cursorX, Y: mainY + cursorY, Width: groupWidth, Height: block.Height})
+            LayoutGroupItems(group, cursorX + 12, cursorY + 34, groupWidth - 24, cardWidth, cardHeight, gap, mainX, mainY)
+        }
+            cursorX += blockWidth + gap
+        }
+        cursorY += row.Height + gap
     }
 
-    EmptyText.Visible := Snippets.Length = 0
+    EmptyText.Visible := (Snippets.Length = 0 && Groups.Length = 0)
     if EmptyText.Visible
         EmptyText.Move(margin, top + 40, width - margin * 2, 80)
 
     if SortModeActive
-        StatusText.Text := "排序模式 · 直接拖动文本按钮调整顺序"
-    else if (Snippets.Length = 0)
+        StatusText.Text := "排序模式 · 拖动文本或分组调整位置"
+    else if (RootItems.Length = 0)
         StatusText.Text := "尚未保存文本"
     else if (totalPages = 1)
         StatusText.Text := Snippets.Length " 个文本段 · 左键粘贴，右键管理"
     else
         StatusText.Text := Snippets.Length " 个文本段 · 第 " CurrentPage "/" totalPages " 页"
+}
+
+BuildLayoutBlocks(width, cardWidth, cardHeight, gap, availableHeight) {
+    global RootItems, GroupById
+
+    blocks := []
+    rootTokens := []
+    rootCount := 0
+    columns := Max(1, Floor((width - 64 + gap) / (cardWidth + gap)))
+    maxRootRows := Max(1, Floor((availableHeight - 34 - 24 - 16 + gap) / (cardHeight + gap)))
+    maxRootItems := Max(1, columns * maxRootRows)
+    FlushRootBlocks(blocks, rootTokens, columns, maxRootItems, cardHeight, gap)
+    rootTokens := []
+    for token in RootItems {
+        if (SubStr(token, 1, 2) = "s:") {
+            rootCount += 1
+            rootTokens.Push(token)
+            if (rootTokens.Length >= maxRootItems) {
+                FlushRootBlocks(blocks, rootTokens, columns, maxRootItems, cardHeight, gap)
+                rootTokens := []
+            }
+        } else if (SubStr(token, 1, 2) = "g:" && GroupById.Has(SubStr(token, 3))) {
+            FlushRootBlocks(blocks, rootTokens, columns, maxRootItems, cardHeight, gap)
+            rootTokens := []
+            group := GroupById[SubStr(token, 3)]
+            blocks.Push({
+                Type: "group",
+                Id: group.Id,
+                Width: GetGroupBlockWidth(group, cardWidth, gap, width - 40),
+                Height: GetGroupBlockHeight(group, cardHeight, gap)
+            })
+        }
+    }
+    FlushRootBlocks(blocks, rootTokens, columns, maxRootItems, cardHeight, gap)
+    if !rootCount
+        blocks.InsertAt(1, {Type: "root", Id: "", Tokens: [], DropOnly: true, Height: 58})
+    return blocks
+}
+
+FlushRootBlocks(blocks, tokens, columns, maxItems, cardHeight, gap) {
+    if !tokens.Length
+        return
+    rows := Max(1, Ceil(tokens.Length / columns))
+    copy := []
+    for token in tokens
+        copy.Push(token)
+    blocks.Push({Type: "root", Id: "", Tokens: copy, DropOnly: false, Height: 34 + 24 + rows * cardHeight + (rows - 1) * gap + 16})
+}
+
+GetGroupBlockWidth(group, cardWidth, gap, availableWidth := 0) {
+    desiredWidth := 24 + group.Cols * cardWidth + (group.Cols - 1) * gap
+    return availableWidth > 0 ? Min(availableWidth, desiredWidth) : desiredWidth
+}
+
+GetGroupBlockHeight(group, cardHeight, gap) {
+    return 34 + 24 + group.Rows * cardHeight + (group.Rows - 1) * gap + 16
+}
+
+BuildLayoutPages(blocks, availableHeight, gap, availableWidth) {
+    rows := []
+    rowItems := []
+    rowWidth := 0
+    rowHeight := 0
+
+    for block in blocks {
+        blockWidth := block.HasOwnProp("Width") ? block.Width : availableWidth
+        blockWidth := Min(blockWidth, availableWidth)
+        requiredWidth := rowItems.Length ? rowWidth + gap + blockWidth : blockWidth
+        if (rowItems.Length && requiredWidth > availableWidth) {
+            rows.Push({Items: rowItems, Width: rowWidth, Height: rowHeight})
+            rowItems := []
+            rowWidth := 0
+            rowHeight := 0
+        }
+
+        rowItems.Push(block)
+        rowWidth := rowItems.Length = 1 ? blockWidth : rowWidth + gap + blockWidth
+        rowHeight := Max(rowHeight, block.Height)
+    }
+    if rowItems.Length
+        rows.Push({Items: rowItems, Width: rowWidth, Height: rowHeight})
+
+    pages := [[]]
+    used := 0
+    for row in rows {
+        if (used > 0 && used + gap + row.Height > availableHeight) {
+            pages.Push([])
+            used := 0
+        }
+        pages[pages.Length].Push(row)
+        used += row.Height + gap
+    }
+    return pages
+}
+
+LayoutRootItems(tokens, x, y, width, cardWidth, cardHeight, gap, mainX, mainY) {
+    global SnippetById
+    columns := Max(1, Floor((width + gap) / (cardWidth + gap)))
+    cellWidth := Max(80, Floor((width - (columns - 1) * gap) / columns))
+    for tokenIndex, token in tokens {
+        snippet := SnippetById[SubStr(token, 3)]
+        slot := tokenIndex - 1
+        row := Floor(slot / columns)
+        column := Mod(slot, columns)
+        px := x + column * (cellWidth + gap)
+        py := y + row * (cardHeight + gap)
+        snippet.Button.Visible := true
+        snippet.Button.Move(px, py, cellWidth, cardHeight)
+        LayoutRegions.Push({Type: "snippet", Id: snippet.Id, GroupId: "", X: mainX + px, Y: mainY + py, Width: cellWidth, Height: cardHeight})
+    }
+}
+
+LayoutGroupItems(group, x, y, width, cardWidth, cardHeight, gap, mainX, mainY) {
+    global SnippetById
+
+    cellWidth := Max(80, Floor((width - (group.Cols - 1) * gap) / group.Cols))
+    visibleIndex := 0
+    for tokenIndex, token in group.Items {
+        if (SubStr(token, 1, 2) != "s:" || !SnippetById.Has(SubStr(token, 3)))
+            continue
+        snippet := SnippetById[SubStr(token, 3)]
+        visibleIndex += 1
+        slot := visibleIndex - 1
+        row := Floor(slot / group.Cols)
+        column := Mod(slot, group.Cols)
+        px := x + column * (cellWidth + gap)
+        py := y + row * (cardHeight + gap)
+        snippet.Button.Visible := true
+        snippet.Button.Move(px, py, cellWidth, cardHeight)
+        LayoutRegions.Push({Type: "snippet", Id: snippet.Id, GroupId: group.Id, X: mainX + px, Y: mainY + py, Width: cellWidth, Height: cardHeight})
+    }
+}
+
+GroupSizeFitsPage(rows, cols, width, height) {
+    if (rows < 1 || cols < 1)
+        return false
+    margin := 20
+    top := 82
+    bottom := 20
+    gap := 16
+    targetWidth := 280
+    cardHeight := 108
+    columns := Max(1, Floor((width - margin * 2 + gap) / (targetWidth + gap)))
+    cardWidth := Floor((width - margin * 2 - gap * (columns - 1)) / columns)
+    desiredWidth := 24 + cols * cardWidth + (cols - 1) * gap
+    groupWidth := Min(width - margin * 2, desiredWidth)
+    groupHeight := 34 + 24 + rows * cardHeight + (rows - 1) * gap + 16
+    innerWidth := groupWidth - 24
+    minimumGridWidth := cols * 80 + (cols - 1) * gap
+    availableHeight := Max(120, height - top - bottom)
+    return groupWidth >= 160 && groupWidth <= width - margin * 2 && minimumGridWidth <= innerWidth && groupHeight <= availableHeight
 }
 
 ShowTemporaryStatus(message) {
